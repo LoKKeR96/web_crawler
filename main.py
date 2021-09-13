@@ -1,28 +1,40 @@
 import gevent
-import requests
 from requests_futures.sessions import FuturesSession
-from lxml.html import fromstring
+from lxml.html import fromstring, HTMLParser
 from urllib.parse import urlparse
 import random
+from requests_html import AsyncHTMLSession
+
 
 # Initialise random generator
 random.seed()
 
 # List of possible resource suffixes
-resources_suffix = [".js", ".css", ".jpg", ".gif", ".png", ".mp4", ".ico", ".svg", ".json", ".xml"]
+RES_SUFFIXES = [".js", ".css", ".jpg", ".gif", ".png", ".mp4", ".ico", ".svg", ".json", ".xml"]
 
 # Header used to pull pages. This ensures we always obtain a valid response.
-headers = {
+HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.132 Safari/537.36 QIHU 360SE'
 }
 
+# How many levels of subpages to scan for links
+SCAN_DEPTH = 2
+
 # Maximum amount of tentatives to sync a page
-max_attempts = 3
+MAX_ATTEMPTS = 3
 
 # URL Paths to avoid if they did not sync successfully after the maximum amount of attempts
 avoid_paths = []
 
-session = FuturesSession(max_workers=4)
+# Enable or disable JavaScript processing - slows down running time significantly
+JAVASCRIPT = False
+# Time in seconds to wait for JavaScript rendering process
+JAVASCRIPT_REND_TIME = 3
+
+# Session used to have concurrent requests
+MAX_WORKERS = 4
+SESSION = AsyncHTMLSession(workers=MAX_WORKERS)
+FUTURE_SESSION = FuturesSession(max_workers=MAX_WORKERS)
 
 
 class Page:
@@ -44,14 +56,31 @@ def is_link_to_resource(link):
     :param link: string, the URL link to check
     :return: True if the link contains a reference to a resource otherwise False
     """
-    for suffix in resources_suffix:
+    for suffix in RES_SUFFIXES:
         if suffix in link:
             return True
+
+
+async def async_session_get(session, url):
+    """
+    An async method to perform asynchronous HTML requests. It also renders
+    the web page and processes the JavaScript code. The latter is useful when
+    there is JavaScript generated content.
+    :param session: HTMl session type of AsyncHTMLSession
+    :param url: the URL to request
+    :return: returns the future object
+    """
+    response = await session.get(url)
+    if response.ok:
+        await response.html.arender(sleep=JAVASCRIPT_REND_TIME)
+    await session.close()
+    return response
 
 
 def get_page_dom(page, cur_attempt=0):
     """
     Pulls the dom of a page such that it's easier to navigate through the HTML tags.
+    :param cur_attempt: current attempt number
     :param page: object of type Page
     :return: no return value
     """
@@ -63,31 +92,36 @@ def get_page_dom(page, cur_attempt=0):
         return
 
     parsed_url = urlparse(page.url)
-    if cur_attempt < max_attempts:
+    if cur_attempt < MAX_ATTEMPTS:
         if parsed_url.path not in avoid_paths:
             print("Processing: " + page.url)
             try:
                 gevent.sleep(random.uniform(0.25, 2))
-                future = session.get(page.url)
-                response = future.result()
-                if response.ok:
-                    page.dom = fromstring(response.content)
-                    return
+                parser = HTMLParser()
+                if JAVASCRIPT:
+
+                    response = SESSION.run(lambda: async_session_get(SESSION, page.url))[0]
+                    if response.ok:
+                        page.dom = fromstring(response.html.html, parser=parser)
+                        return page.dom
+                    else:
+                        raise Exception(response.status_code)
                 else:
-                    print("Did not succeed requesting page, err=" + str(response.status_code))
-            except requests.exceptions.TooManyRedirects as e:
-                # Should probably not try again
-                print("Too many redirects...")
-            except requests.exceptions.ConnectionError as e:
-                print("Could not connect...")
-            except requests.exceptions.Timeout as e:
-                print("Timeout. Try again.")
+                    future = FUTURE_SESSION.get(page.url, headers=HEADERS)
+                    response = future.result()
+                    if response.ok:
+                        page.dom = fromstring(response.content, parser=parser)
+                        return page.dom
+                    else:
+                        raise Exception(response.status_code)
+            except Exception as e:
+                print("Error while requesting page " + page.url + ", err=" + str(e))
             get_page_dom(page, cur_attempt + 1)
         else:
             print("Skipping: " + page.url)
     else:
-        print(parsed_url.path)
         avoid_paths.append(parsed_url.path)
+    return None
 
 
 def parse_links(page):
@@ -169,10 +203,9 @@ def sync_subpages(root_page, depth, cur_depth=0):
     :return:
     """
     if cur_depth < depth:
-        threads = []
+        threads = [gevent.spawn(sync_page, sub_page) for sub_page in root_page.sub_pages]
+        gevent.joinall(threads)
         for sub_page in root_page.sub_pages:
-            threads.append(gevent.spawn(sync_page, sub_page))
-            gevent.joinall(threads)
             sync_subpages(sub_page, depth, cur_depth + 1)
 
 
@@ -208,7 +241,7 @@ if __name__ == '__main__':
     sync_page(main_page)
 
     print("Syncing sub pages...")
-    sync_subpages(main_page, 2)
+    sync_subpages(main_page, SCAN_DEPTH)
 
     print("\n\nPages graph:")
-    print_pages_graph(main_page, 2)
+    print_pages_graph(main_page, SCAN_DEPTH)
